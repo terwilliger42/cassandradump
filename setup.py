@@ -4,7 +4,7 @@ except ImportError:
     from distutils.core import setup
 
 requires = [
-    'cassandra-driver==2.7.2',
+    'cassandra-driver==2.7.2', 'progressbar',
 ]
 
 with open('README.rst') as f:
