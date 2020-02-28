@@ -195,8 +195,13 @@ def import_data(session):
 
     with LineCountProgressBar() as prog:
         for i, line in enumerate(fp):
+            # Skip comments
+            if line.startswith('#'):
+                continue
+
             prog.update(i)
             statement += line
+
             if statement.endswith(";\n"):
                 if can_execute_concurrently(statement):
                     enqueue_concurrent(statement)
