@@ -1,12 +1,17 @@
 #!/bin/env python3
 
 import argparse
+import json
 import random
+import re
 import sys
 import itertools
 import codecs
+from enum import Enum
 from getpass import getpass
 import ssl
+from json import JSONDecodeError
+from typing import Optional
 import cassandra
 import cassandra.concurrent
 from cassandra.auth import PlainTextAuthProvider
@@ -14,16 +19,18 @@ from cassandra.cluster import Cluster
 import cassandra.policies
 import cassandra.query
 import progressbar
+import logging
 
 TIMEOUT = 120.0
 FETCH_SIZE = 100
 CONCURRENT_BATCH_SIZE = 1000
 UNSPECIFIED_PASSWORD = "___UNSPECIFIED_PASSWORD____"
 
-args = None
+args = None  # type: Optional[argparse.Namespace]
+log = None  # type: Optional[logging.Logger]
 
 
-class LineCountProgressBar:
+class LineCountProgressBar(progressbar.ProgressBar):
     """
     A line counting progressbar, wrapped into a context manager.
     """
@@ -34,26 +41,18 @@ class LineCountProgressBar:
                 '◐◓◑◒',
                 "⠁⠂⠄⡀⢀⠠⠐⠈")
 
-    def __init__(self):
+    def __init__(self) -> None:
         # Pick a random spinner
         markers = random.choice(self.SPINNERS)
-        self.progress = progressbar.ProgressBar(
+        progressbar.ProgressBar.__init__(
+            self,
             widgets=[progressbar.AnimatedMarker(markers=markers), progressbar.FormatLabel(" %(elapsed)s %(value)d rows")],
             maxval=progressbar.UnknownLength,
-            fd=sys.stderr)
+            fd=sys.stderr
+        )
 
         # How often should the progress bar be updated (every X increments)
-        self.progress.update_interval = 1000
-
-    def __enter__(self):
-        self.progress.start()
-        return self
-
-    def update(self, line_count: int):
-        self.progress.update(line_count)
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.progress.finish()
+        self.update_interval = 1000
 
 
 def cql_type(val):
@@ -61,11 +60,6 @@ def cql_type(val):
         return val.data_type.typename
     except AttributeError:
         return val.cql_type
-
-
-def log_quiet(msg):
-    if not args.quiet:
-        print(msg, file=sys.stderr)
 
 
 def format_cql_table_name(keyspace: str, table_name: str) -> str:
@@ -152,11 +146,11 @@ def table_to_cqlfile(session, keyspace, tablename, flt, tableval, filep, limit=0
     value_encoders = make_value_encoders(tableval)
     row_encoder = make_row_encoder()
 
-    with LineCountProgressBar() as prog:
+    with CommandHandler(log_=log) as cmd_handler:
         for i, row in enumerate(rows):
             values = dict((k, value_encoders[k](v)) for k, v in row.items())
             filep.write("%s;\n" % row_encoder(values))
-            prog.update(i)
+            cmd_handler.update_line_count(i)
 
 
 def can_execute_concurrently(statement):
@@ -164,6 +158,155 @@ def can_execute_concurrently(statement):
         return False
 
     return statement.upper().startswith('INSERT') or statement.upper().startswith('UPDATE')
+
+
+class ProgressBarType(Enum):
+    LINE_COUNT = 'lc'
+    """ Built-in twiddler progress bar based on line count """
+
+    USER_DEFINED = 'cb'
+    """ User defined progress bar, initialized/updated via comments in the CQL."""
+
+    NONE = 'X'
+    """ No progress bar in use"""
+
+    PENDING = 'p'
+    """ No progress bar in use; at first CQL line will be initialized as LINE_COUNT. """
+
+
+class Command(Enum):
+    """
+    Commands that may be embedded into the CQL comments.  See CommandHandler
+    """
+    WRITE_LOG = 'CDUMP_LOG'
+    PROGRESS_START = 'CDUMP_PROGRESS_START'
+    PROGRESS_UPDATE = 'CDUMP_PROGRESS_UPDATE'
+    PROGRESS_END = 'CDUMP_PROGRESS_END'
+
+
+class LogLevel(Enum):
+    """
+    Unfortunately logging doesn't have a documented way to transform a log level string to the int in expects. :-(
+    """
+    FATAL = 'fatal'
+    CRITICAL = 'critical'
+    ERROR = 'error'
+    WARNING = 'warning'
+    INFO = 'info'
+    DEBUG = 'debug'
+
+
+class CommandHandler:
+    """
+    Processes special commands found in CQL comments and takes action.
+
+    The expected format in the CQL is:
+    # <COMMAND_NAME>: <JSON_DICT_PARAMS>
+
+    Valid commands:
+    # CDUMP_LOG: {"level": "info", "message": "Some log message"}
+    -- Prints a message to the log (level: debug, info, warning, critical, fatal)
+
+    # CDUMP_PROGRESS_START: {"total": 571790}
+    -- Creates new user defined progress bar; disables the current progress bar.  Once created,
+        the progress bar will be only be updated by CDUMP_PROGRESS_UPDATE.
+
+    # CDUMP_PROGRESS_UPDATE: {"value": 568850}
+    -- Update the user defined progress bar.
+
+    # CDUMP_PROGRESS_END: {}
+    -- Kill off the user defined progressbar
+    """
+    def __init__(self, log_: 'logging.Logger'):
+        self.progress_bar = None
+        self.progress_bar_type = ProgressBarType.PENDING
+        self.log = log_
+
+    def __enter__(self) -> 'CommandHandler':
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.end_progress_bar()
+
+    def handle_comment(self, line: str) -> None:
+        """
+        Processes a CQL comment and takes action.
+
+        Comments that aren't valid commands are silently ignored.
+        """
+        m = re.match(r'# (?P<command>CDUMP_\w+):\S*(?P<params_json>.*)$', line)
+        if not m:
+            return
+
+        try:
+            cmd = Command(m.group('command'))
+        except ValueError:
+            # Invalid command
+            return
+
+        try:
+            params = json.loads(m.group('params_json'))
+        except JSONDecodeError:
+            # Invalid json
+            return
+
+        if cmd is Command.WRITE_LOG:
+            try:
+                level = LogLevel(params.get('level'))
+            except ValueError:
+                level = LogLevel.INFO
+
+            self.log.log(level=getattr(logging, level.name), msg=params['message'])
+
+        elif cmd is Command.PROGRESS_START:
+            self.set_user_progress_bar(total=params['total'])
+
+        elif cmd is Command.PROGRESS_UPDATE:
+            if self.progress_bar_type is ProgressBarType.USER_DEFINED:
+                # Don't call update() with a value > max -- it will raise a ValueError.
+                self.progress_bar.update(min(self.progress_bar.maxval, params['value']))
+
+        elif cmd is Command.PROGRESS_END:
+            self.end_progress_bar()
+
+    def update_line_count(self, line_count: int) -> None:
+        """
+        Called as new lines are processed during import, updates the twiddler if it's currently displayed.
+        """
+        if self.progress_bar_type is ProgressBarType.LINE_COUNT:
+            pass
+        elif self.progress_bar_type is ProgressBarType.PENDING:
+            # First CQL has been called & no user defined progress bar.  Setup the twiddler.
+            self.progress_bar = LineCountProgressBar().start()
+            self.progress_bar_type = ProgressBarType.LINE_COUNT
+        else:
+            # Twiddler not displayed
+            return
+
+        self.progress_bar.update(line_count)
+
+    def set_user_progress_bar(self, total: int) -> None:
+        """
+        Initializes a new user-defined progress bar
+        :param total: Maximum progress value
+        """
+        # Kill off any previous progress bar
+        self.end_progress_bar()
+        self.progress_bar = progressbar.ProgressBar(
+            widgets=[progressbar.Percentage(), progressbar.Bar(), progressbar.ETA()], maxval=total, fd=sys.stderr
+        ).start()
+        self.progress_bar_type = ProgressBarType.USER_DEFINED
+
+    def end_progress_bar(self) -> None:
+        """
+        Shutdown the active progress bar, if any.
+        """
+        if self.progress_bar is None:
+            return
+
+        self.progress_bar.finish()
+        self.progress_bar = None
+        self.progress_bar_type = ProgressBarType.NONE
 
 
 def import_data(session):
@@ -193,13 +336,14 @@ def import_data(session):
     statement = ''
     concurrent_statements = []
 
-    with LineCountProgressBar() as prog:
+    with CommandHandler(log_=log) as cmd_handler:
         for i, line in enumerate(fp):
             # Skip comments
             if line.startswith('#'):
+                cmd_handler.handle_comment(line)
                 continue
 
-            prog.update(i)
+            cmd_handler.update_line_count(i)
             statement += line
 
             if statement.endswith(";\n"):
@@ -239,6 +383,21 @@ def get_column_family_or_fail(keyspace, tablename):
     return tableval
 
 
+def log_cql(message: str, level: Optional[LogLevel] = LogLevel.INFO) -> str:
+    """
+    Returns the command string needed in order to log the specified message when the export is being imported.
+
+    Example:
+    log_cql(message="Hello", level=LogLevel.DEBUG)
+    --> "# CDUMP_LOG: {"message": "Hello", "level": "debug"}\n"
+    """
+    params = {
+        'level': level.value,
+        'message': message
+    }
+    return "# CDUMP_LOG: {}\n".format(json.dumps(params))
+
+
 def export_data(session):
     selection_options_count = sum(1 if x else 0 for x in (args.keyspace, args.cf, args.filter))
     assert selection_options_count <= 1, "--cf, --keyspace and --filter can\'t be combined"
@@ -252,7 +411,7 @@ def export_data(session):
     exclude_list = []
 
     if selection_options_count == 0:
-        log_quiet('Exporting all keyspaces')
+        log.info('Exporting all keyspaces')
         keyspaces = []
         for keyspace in session.cluster.metadata.keyspaces.keys():
             if keyspace not in ('system', 'system_traces'):
@@ -273,19 +432,25 @@ def export_data(session):
             keyspace = get_keyspace_or_fail(session, keyname)
 
             if not args.no_create:
-                log_quiet('Exporting schema for keyspace ' + keyname)
+                log.info('Exporting schema for keyspace ' + keyname)
+                f.write(log_cql("Dropping keyspace {}".format(keyname)))
                 f.write('DROP KEYSPACE IF EXISTS "' + keyname + '";\n')
+                f.write(log_cql("Creating keyspace {}".format(keyname)))
                 f.write(keyspace.export_as_string() + '\n')
 
             for tablename, tableval in keyspace.tables.items():
                 if tablename in exclude_list:
-                    log_quiet('Skipping data export for table ' + keyname + '.' + tablename)
+                    log.info('Skipping data export for table ' + keyname + '.' + tablename)
                     continue
                 elif tableval.is_cql_compatible:
+                    tab_name = format_cql_table_name(keyname, tablename)
                     if args.truncate:
-                        f.write('TRUNCATE TABLE {table};\n'.format(table=format_cql_table_name(keyname, tablename)))
+                        f.write(log_cql("Truncating {}".format(tab_name)))
+                        f.write('TRUNCATE TABLE {table};\n'.format(table=tab_name))
+
                     if not args.no_insert:
-                        log_quiet('Exporting data for table ' + keyname + '.' + tablename)
+                        log.info('Exporting data for table ' + keyname + '.' + tablename)
+                        f.write(log_cql("Importing {}".format(tab_name)))
                         table_to_cqlfile(session, keyname, tablename, None, tableval, f, limit)
 
     if args.cf is not None:
@@ -302,15 +467,19 @@ def export_data(session):
 
             if tableval.is_cql_compatible:
                 if not args.no_create:
-                    log_quiet('Exporting schema for table ' + keyname + '.' + tablename)
+                    log.info('Exporting schema for table ' + keyname + '.' + tablename)
+                    f.write(log_cql("Dropping {}.{}".format(keyname, tablename)))
                     f.write('DROP TABLE IF EXISTS "' + keyname + '"."' + tablename + '";\n')
+                    f.write(log_cql("Creating {}.{}".format(keyname, tablename)))
                     f.write(tableval.export_as_string() + ';\n')
 
                 if args.truncate:
+                    f.write(log_cql("Truncating {}".format(tablename)))
                     f.write('TRUNCATE TABLE {table};\n'.format(table=format_cql_table_name(keyname, tablename)))
 
                 if not args.no_insert:
-                    log_quiet('Exporting data for table ' + keyname + '.' + tablename)
+                    log.info('Exporting data for table ' + keyname + '.' + tablename)
+                    f.write(log_cql("Importing {}".format(tablename)))
                     table_to_cqlfile(session, keyname, tablename, None, tableval, f, limit)
 
     if args.filter is not None:
@@ -333,7 +502,7 @@ def export_data(session):
                 sys.exit(1)
 
             if not args.no_insert:
-                log_quiet('Exporting data for filter "' + stripped + '"')
+                log.info('Exporting data for filter "' + stripped + '"')
                 table_to_cqlfile(session, keyname, tablename, stripped, tableval, f, limit)
 
     f.close()
@@ -413,7 +582,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
 
 
 def main():
-    global args
+    global args, log
     pparser = argparse.ArgumentParser(description='A data exporting tool for Cassandra inspired from mysqldump, with some added slice and dice capabilities.',
                                       add_help=False)
 
@@ -427,7 +596,7 @@ def main():
     add_common_args(sp)
     sp.add_argument('--cf',
                     help='export a column family. The name must include the keyspace, e.g. "system.schema_columns". Can be specified multiple times',
-                    action='append')
+                    nargs='+')
     sp.add_argument('--file', '-f', help='export data to the specified file, instead of stdout')
     sp.add_argument('--filter', help='export a slice of a column family according to a CQL filter. This takes essentially a typical SELECT query stripped '
                                      'of the initial "SELECT ... FROM" part (e.g. "system.schema_columns where keyspace_name =\'OpsCenter\'", and exports '
@@ -470,6 +639,16 @@ def main():
         # User specified "-p" but with no argument.  Prompt for the password.
         args.password = getpass()
     session = setup_cluster()
+
+    # Init logging after Cassandra connection -- it logs to INFO on connect.
+    if args.quiet:
+        log_level = logging.WARNING
+    else:
+        log_level = logging.INFO
+
+    # noinspection PyArgumentList
+    logging.basicConfig(format='{asctime} ({process} {name}) [{levelname}] {message}', style='{', level=log_level)
+    log = logging.getLogger()
 
     if args.command == 'import':
         import_data(session)
